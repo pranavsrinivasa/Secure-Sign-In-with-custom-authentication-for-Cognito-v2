@@ -26,19 +26,23 @@ Parameters:
 
 Resources:
   UnauthenticatedRole:
-    Type: AWS::IAM::Role
+    Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: UnauthenticatedRole
+      RoleName: CognitoS3AccessRole
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
-            Action: sts:AssumeRole
-      Path: /
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
       Policies:
-        - PolicyName: S3GetObjectPolicy
+        - PolicyName: S3AndCognitoAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -46,7 +50,12 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+                Resource: 'arn:aws:s3:::pransri-tos-bucket-3/*'
+              - Sid: Statement1
+                Effect: Allow
+                Action:
+                  - cognito-identity:GetCredentialsForIdentity
+                Resource: '*'
 
   ToSBucket:
     Type: AWS::S3::Bucket
@@ -55,6 +64,15 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
       AccessControl: Private
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: 
+              - "*"
+            AllowedMethods: 
+              - GET
+            AllowedOrigins: 
+              - "*"
+
   ToSBucketPolicy:
     Type: AWS::S3::BucketPolicy
     DependsOn: LambdaExecutionRole
