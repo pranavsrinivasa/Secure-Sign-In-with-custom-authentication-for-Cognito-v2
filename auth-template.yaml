@@ -1,0 +1,641 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Authentication System with Cognito, reCAPTCHA, and Dynamic ToS
+
+Parameters:
+  RecaptchaSecret:
+    Type: String
+    Description: Recaptcha Secret API Key
+    NoEcho: true
+  RecaptchaSiteKey:
+    Type: String
+    Description: Recaptcha Site API Key
+    NoEcho: true
+  GitHubRepo:
+    Type: String
+    Description: "Fork Repo: https://github.com/pranavsrinivasa/Secure-Sign-In-with-custom-authentication-for-Cognito-v2 and insert the github repo link"
+  GitHubBranch:
+    Type: String
+    Default: master
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: Github PAT Token
+  S3BucketName:
+    Type: String
+    Description: S3-Bucket-Name
+
+Resources:
+  UnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: UnauthenticatedRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: S3GetObjectPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowGetObject
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+
+  ToSBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      AccessControl: Private
+  ToSBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: LambdaExecutionRole
+    Properties:
+      Bucket: !Ref S3BucketName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+            - s3:GetObject
+            - s3:ListBucket
+            Effect: "Allow"
+            Principal:
+              AWS: 
+                - !GetAtt LambdaExecutionRole.Arn
+                - !GetAtt UnauthenticatedRole.Arn
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  PreSignUpLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PreSignUpLambda.Arn  # Reference your Lambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}
+
+  # Repeat for other triggers (DefineAuth, CreateAuth, VerifyAuth)
+  DefineAuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DefineAuthLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}
+
+  CreateAuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CreateAuthLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}
+
+  VerifyAuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt VerifyAuthLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action: 
+                - s3:GetObject
+                - s3:ListBucket
+                Resource: 
+                - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                - !Sub 'arn:aws:s3:::${S3BucketName}'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  PreSignUpLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PreSignUpTrigger
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET: !Ref S3BucketName
+          KEY: tosfiles/test.txt
+          RECAPTCHA_SECRET: !Ref RecaptchaSecret
+          BUCKET_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const querystring = require('querystring');
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+          const { createHash } = require('crypto');
+          const stream = require('stream');
+          const s3 = new S3Client({region: process.env.BUCKET_REGION});
+          const bucket = process.env.BUCKET;
+          const key = process.env.KEY;
+          async function streamToString(stream) {
+            return await new Promise((resolve, reject) => {
+              const chunks = [];
+              stream.on('data', (chunk) => chunks.push(chunk));
+              stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+              stream.on('error', reject);
+            });
+          }
+          async function getToS() {
+            const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+            const obj = await s3.send(command);
+            const buffer = await streamToString(obj.Body);
+            return buffer;
+          }
+          async function getCurrentSha() {
+            const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+            const obj = await s3.send(command);
+            const buffer = await streamToString(obj.Body);
+            const hash = createHash('sha256').update(buffer).digest('hex');
+            console.log(hash);
+            return hash;
+          }
+          exports.handler = async (event) => {
+            const secret = process.env.RECAPTCHA_SECRET;
+            // Build the POST body
+            const token = event.request.validationData.token
+            if (!token) {
+              throw new Error('No reCAPTCHA token provided');
+            }
+            const postData = querystring.stringify({
+              secret: secret,
+              response: token
+            });
+            // Helper to call Google
+            const verifyGoogle = () => {
+              const options = {
+                hostname: 'www.google.com',
+                path: '/recaptcha/api/siteverify',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Content-Length': postData.length
+                }
+              };
+              return new Promise((resolve, reject) => {
+                const req = https.request(options, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    try {
+                      const parsed = JSON.parse(data);
+                      resolve(parsed);
+                    } catch (err) {
+                      reject(err);
+                    }
+                  });
+                });
+                req.on('error', reject);
+                req.write(postData);
+                req.end();
+              });
+            };
+            const googleRes = await verifyGoogle();
+            if (!googleRes.success) {
+              throw new Error(`Captcha Validation Failed`);
+            }
+            const currentSha = await getCurrentSha();
+            const acceptedSha = event.request.userAttributes['custom:TosValidity'];
+            console.log(acceptedSha);
+            if (acceptedSha !== currentSha){
+              throw new Error(`ToS has not been accepted or the ToS has changed`);
+            }
+            return event;
+          };
+
+  DefineAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DefineAuthChallenge
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET: !Ref S3BucketName
+          KEY: tosfiles/test.txt
+          BUCKET_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+          const { createHash } = require('crypto');
+          const stream = require('stream');
+
+          const s3 = new S3Client({region: process.env.BUCKET_REGION});
+          const bucket = process.env.BUCKET;
+          const key = process.env.KEY;
+
+          async function streamToString(stream) {
+            return await new Promise((resolve, reject) => {
+              const chunks = [];
+              stream.on('data', (chunk) => chunks.push(chunk));
+              stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+              stream.on('error', reject);
+            });
+          }
+
+          async function getCurrentSha() {
+            const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+            const obj = await s3.send(command);
+            const buffer = await streamToString(obj.Body);
+            const hash = createHash('sha256').update(buffer).digest('hex');
+            console.log(hash);
+            return hash;
+          }
+
+          exports.handler = async (event) => {
+            if (
+              event.request.session.length === 1 &&
+              event.request.session[0].challengeName === "SRP_A"
+            ) {
+              event.response.issueTokens = false;
+              event.response.failAuthentication = false;
+              event.response.challengeName = "PASSWORD_VERIFIER";
+              return event;
+            }
+            if (
+              event.request.session.length === 2 &&
+              event.request.session[1].challengeName === "PASSWORD_VERIFIER" &&
+              event.request.session[1].challengeResult === true
+            ) {
+              event.response.issueTokens = false;
+              event.response.failAuthentication = false;
+              event.response.challengeName = "CUSTOM_CHALLENGE";
+              return event;
+            }
+            if (
+              event.request.session.length === 3 &&
+              event.request.session[2].challengeName === "CUSTOM_CHALLENGE" &&
+              event.request.session[2].challengeResult === true
+            ) {
+              const acceptedSha = event.request.userAttributes['custom:TosValidity'];
+              const currentSha = await getCurrentSha();
+              if (acceptedSha !== currentSha){
+                event.response.issueTokens = false;
+                event.response.failAuthentication = false;
+                event.response.challengeName = "CUSTOM_CHALLENGE";
+              }else{
+              event.response.issueTokens = true;
+              event.response.failAuthentication = false;
+              }
+              return event;
+            }
+            if (
+              event.request.session.length === 4 &&
+              event.request.session[3].challengeName === "CUSTOM_CHALLENGE" &&
+              event.request.session[3].challengeResult === true
+            ) {
+              event.response.issueTokens = true;
+              event.response.failAuthentication = false;
+              return event;
+            }
+
+            event.response.issueTokens = false;
+            event.response.failAuthentication = true;
+            return event;
+          };
+
+  CreateAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateAuthChallenge
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET: !Ref S3BucketName
+          KEY: tosfiles/test.txt
+          BUCKET_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+          const { createHash } = require('crypto');
+          const stream = require('stream');
+          const s3 = new S3Client({region: process.env.BUCKET_REGION});
+          const bucket = process.env.BUCKET;
+          const key = process.env.KEY;
+          async function streamToString(stream) {
+            return await new Promise((resolve, reject) => {
+              const chunks = [];
+              stream.on('data', (chunk) => chunks.push(chunk));
+              stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+              stream.on('error', reject);
+            });
+          }
+          async function getToS() {
+            const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+            const obj = await s3.send(command);
+            const buffer = await streamToString(obj.Body);
+            return buffer;
+          }
+          async function getCurrentSha() {
+            const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+            const obj = await s3.send(command);
+            const buffer = await streamToString(obj.Body);
+            const hash = createHash('sha256').update(buffer).digest('hex');
+            console.log(hash);
+            return hash;
+          }
+
+          exports.handler = async (event) => {
+            // Only generate on initial CUSTOM_CHALLENGE
+            if (event.request.challengeName === 'CUSTOM_CHALLENGE' &&
+                event.request.session.length === 2) {
+              event.response.publicChallengeParameters = {
+                captcha: 'captcha'
+              };
+              event.response.privateChallengeParameters = {
+                step: 'Captcha'
+              };
+              event.response.challengeMetadata = 'RECAPTCHA_CHALLENGE';
+              console.info('Captcha')
+            }else if(event.request.challengeName === 'CUSTOM_CHALLENGE' &&
+              event.request.session.length === 3){
+                const currentTos = await getToS();
+                event.response.publicChallengeParameters = {
+                  tos: currentTos
+                };
+                const currentSha = await getCurrentSha();
+                console.info('TOS')
+                event.response.privateChallengeParameters = {
+                  CorrectTOS: currentSha,
+                  step: 'TOS'
+                };
+            }
+            return event;
+          };
+
+
+  VerifyAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: VerifyAuthChallenge
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          RECAPTCHA_SECRET: !Ref RecaptchaSecret
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const querystring = require('querystring');
+          const { CognitoIdentityProviderClient, AdminUpdateUserAttributesCommand } = require('@aws-sdk/client-cognito-identity-provider');
+          const { createHash } = require('crypto');
+
+          const client = new CognitoIdentityProviderClient();
+
+          exports.handler = async (event) => {
+           
+            if(event.request.privateChallengeParameters.step === 'TOS'){
+              const hash = createHash('sha256').update(event.request.challengeAnswer).digest('hex');
+              const answer = hash === event.request.privateChallengeParameters.CorrectTOS;
+              console.log(hash,event.request.privateChallengeParameters.CorrectTOS,answer)
+              if(answer){
+                const input = {
+                  UserPoolId: event.userPoolId,
+                  Username: event.userName,
+                  UserAttributes:[
+                    {
+                      Name: "custom:TosValidity",
+                      Value: hash,
+                    },
+                  ]
+                };
+                const command = new AdminUpdateUserAttributesCommand(input);
+                const response = await client.send(command);
+              }
+              event.response.answerCorrect = answer;
+              return event;
+            }
+
+            if(event.request.privateChallengeParameters.step === 'Captcha'){
+              const token = event.request.challengeAnswer;
+              const secret = process.env.RECAPTCHA_SECRET;
+              // Build the POST body
+              const postData = querystring.stringify({
+                secret: secret,
+                response: token
+              });
+              // Helper to call Google
+              const verifyGoogle = () => {
+                const options = {
+                  hostname: 'www.google.com',
+                  path: '/recaptcha/api/siteverify',
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Content-Length': postData.length
+                  }
+                };
+                return new Promise((resolve, reject) => {
+                  const req = https.request(options, (res) => {
+                    let data = '';
+                    res.on('data', chunk => data += chunk);
+                    res.on('end', () => {
+                      try {
+                        const parsed = JSON.parse(data);
+                        resolve(parsed);
+                      } catch (err) {
+                        reject(err);
+                      }
+                    });
+                  });
+                  req.on('error', reject);
+                  req.write(postData);
+                  req.end();
+                });
+              };
+              let answerCorrect = false;
+              try {
+                const googleRes = await verifyGoogle();
+                // For v2 checkbox or v3 score, you could also check googleRes.score
+                if (googleRes.success === true) {
+                  answerCorrect = true;
+                }
+              } catch (err) {
+                throw new Error(`Error verifying reCAPTCHA response: ${err.message}`);
+              }
+              event.response.answerCorrect = answerCorrect;
+              return event;
+            }
+            event.response.answerCorrect = false;
+            return event;
+          };
+ 
+
+
+  # New S3 File Fetch Lambda Function
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SecureAuthUserPoolV2
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+        - AttributeDataType: String
+          Name: TosValidity
+          Mutable: true
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpLambda.Arn
+        DefineAuthChallenge: !GetAtt DefineAuthLambda.Arn
+        CreateAuthChallenge: !GetAtt CreateAuthLambda.Arn
+        VerifyAuthChallengeResponse: !GetAtt VerifyAuthLambda.Arn
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AutoVerifiedAttributes:
+        - email  # Triggers email verification
+      VerificationMessageTemplate:
+          DefaultEmailOption: CONFIRM_WITH_CODE
+          EmailMessage: "Your verification code is {####}"
+          EmailSubject: "Verify Your Email"
+      EmailConfiguration:
+          EmailSendingAccount: COGNITO_DEFAULT  # Use Cognito's built-in email
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: AuthClient-SpaClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - http://localhost:3000  # Replace with your application URL
+      LogoutURLs:
+        - http://localhost:3000  # Replace with your application URL
+      SupportedIdentityProviders:
+        - COGNITO
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      AllowUnauthenticatedIdentities: true
+      IdentityPoolName: S3AccessIdentityPool
+
+  IdentityPoolRoleAttachment: 
+    Type: AWS::Cognito::IdentityPoolRoleAttachment 
+    Properties: 
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles: 
+        "unauthenticated": !GetAtt UnauthenticatedRole.Arn
+
+  # Amplify Application with Public GitHub Integration
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub ${AWS::StackName}-Frontend
+      Repository: !Ref GitHubRepo
+      AccessToken: !Ref GitHubToken
+      BuildSpec: |
+        version: 1.0
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: REACT_APP_POOLID
+          Value: !Ref CognitoUserPool
+        - Name: REACT_APP_POOL_CLIENT_ID
+          Value: !Ref CognitoUserPoolClient
+        - Name: REACT_APP_IDENTITYPOOLID
+          Value: !Ref CognitoIdentityPool
+        - Name: REACT_APP_REGION
+          Value: !Ref AWS::Region
+        - Name: REACT_APP_SITE_KEY
+          Value: !Ref RecaptchaSiteKey
+        - Name: REACT_APP_S3NAME
+          Value: !Ref S3BucketName
+        - Name: REACT_APP_PREFIXKEY
+          Value: tosfiles/test.txt
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      Stage: PRODUCTION
+      EnableAutoBuild: true
+      EnablePerformanceMode: false
+
+Outputs:
+  UserPoolId:
+    Value: !Ref CognitoUserPool
+  UserPoolClientId:
+    Value: !Ref CognitoUserPoolClient
+  AmplifyAppId:
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyDomain:
+    Value: !GetAtt AmplifyApp.DefaultDomain
+  FrontendURL:
+    Value: !Sub https://${GitHubBranch}.${AmplifyApp.DefaultDomain}
+  S3BucketName:
+    Value: !Ref ToSBucket
+  # New API Gateway Output
+  FileFetchEndpoint:
+    Value: !Sub https://${ApiGatewayV2Api}.execute-api.${AWS::Region}.amazonaws.com
