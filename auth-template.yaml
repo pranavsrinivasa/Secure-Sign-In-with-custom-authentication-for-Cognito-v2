@@ -636,6 +636,3 @@ Outputs:
     Value: !Sub https://${GitHubBranch}.${AmplifyApp.DefaultDomain}
   S3BucketName:
     Value: !Ref ToSBucket
-  # New API Gateway Output
-  FileFetchEndpoint:
-    Value: !Sub https://${ApiGatewayV2Api}.execute-api.${AWS::Region}.amazonaws.com
