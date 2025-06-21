@@ -13,7 +13,7 @@ Enterprise-ready security controls
 
 ## Architechture:
 
-![Image](https://github.com/user-attachments/assets/af381030-e6a5-42fa-b76c-7c5b839e0387)
+![Image](https://github.com/user-attachments/assets/27c46327-e34f-4449-b840-c6ca411ffb1a)
 
 ## Design Workflow
 
